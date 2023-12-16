@@ -2,7 +2,10 @@ package main
 
 import (
 	"fmt"
+	"sync"
 	"time"
+
+	"google.golang.org/grpc/status"
 )
 
 // ЗАДАНИЕ:
@@ -22,29 +25,67 @@ type Ttype struct {
 	taskRESULT []byte
 }
 
+var ISDEBUG = false
+
+func dprint(d ...any) {
+	if ISDEBUG {
+		fmt.Println(d...)
+	}
+}
+
+var n = 10
+
+var TtypePool = sync.Pool{
+	New: func() any { return &Ttype{} },
+}
+
+func getTtype() *Ttype {
+	ifc := TtypePool.Get()
+	if ifc != nil {
+		return ifc.(*Ttype)
+	}
+	return TtypePool.New().(*Ttype)
+}
+func putTtype(b any) {
+	TtypePool.Put(b)
+}
+
 func main() {
-	taskCreturer := func(a chan Ttype) {
+	taskCreturer := func(a chan *Ttype) {
 		go func() {
 			for {
 				ft := time.Now().Format(time.RFC3339)
-				if time.Now().Nanosecond()%2 > 0 { // вот такое условие появления ошибочных тасков
-					ft = "Some error occured"
+				if ISDEBUG {
+					if time.Now().Second()%2 > 0 { // вот такое условие появления ошибочных тасков
+						ft = "Some error occured"
+					}
+				} else {
+					if time.Now().Nanosecond()%2 > 0 { // вот такое условие появления ошибочных тасков
+						ft = "Some error occured"
+					}
 				}
-				a <- Ttype{cT: ft, id: int(time.Now().Unix())} // передаем таск на выполнение
+				t := getTtype()
+				t.cT = ft
+				t.id = int(time.Now().Unix())
+				a <- t // передаем таск на выполнение
 			}
 		}()
 	}
-
-	superChan := make(chan Ttype, 10)
-
-	go taskCreturer(superChan)
-
-	task_worker := func(a Ttype) Ttype {
+	var dCounter any
+	if ISDEBUG {
+		dCounter = int(0)
+	}
+	task_worker := func(a *Ttype) *Ttype {
 		tt, _ := time.Parse(time.RFC3339, a.cT)
 		if tt.After(time.Now().Add(-20 * time.Second)) {
 			a.taskRESULT = []byte("task has been successed")
+			dprint("ok")
 		} else {
 			a.taskRESULT = []byte("something went wrong")
+			dprint("bad")
+			if ISDEBUG {
+				dCounter = dCounter.(int)+1
+			}
 		}
 		a.fT = time.Now().Format(time.RFC3339Nano)
 
@@ -53,52 +94,82 @@ func main() {
 		return a
 	}
 
-	doneTasks := make(chan Ttype)
+	superChan := make(chan *Ttype, n)
+	doneTasks := make(chan *Ttype)
 	undoneTasks := make(chan error)
 
-	tasksorter := func(t Ttype) {
+	tasksorter := func(t *Ttype) {
 		if string(t.taskRESULT[14:]) == "successed" {
 			doneTasks <- t
 		} else {
-			undoneTasks <- fmt.Errorf("Task id %d time %s, error %s", t.id, t.cT, t.taskRESULT)
+			putTtype(t)
+			undoneTasks <- status.Errorf(1234, "Task id %d time %s, error %s", t.id, t.cT, t.taskRESULT)
 		}
 	}
 
+	var mu sync.Mutex
 	go func() {
 		// получение тасков
-		for t := range superChan {
-			t = task_worker(t)
-			go tasksorter(t)
+	one:
+		for {
+			select {
+			case t, ok := <-superChan:
+				if !ok {
+					break one
+				}
+				mu.Lock()
+				go tasksorter(task_worker(t))
+				mu.Unlock()
+			}
 		}
 		close(superChan)
 	}()
 
-	result := map[int]Ttype{}
-	err := []error{}
+	go taskCreturer(superChan)
+
+	var result sync.Map /// := make(map[int]*Ttype,10)
+	err := make([]error, 0, n)
 	go func() {
-		for r := range doneTasks {
-			go func() {
-				result[r.id] = r
-			}()
-		}
-		for r := range undoneTasks {
-			go func() {
-				err = append(err, r)
-			}()
+	one1:
+		for {
+			select {
+			case r, ok := <-doneTasks:
+				if !ok {
+					break one1
+				}
+				result.Store(r.id, r)
+			}
 		}
 		close(doneTasks)
+	}()
+	go func() {
+	one1:
+		for {
+			select {
+			case r, ok := <-undoneTasks:
+				if !ok {
+					break one1
+				}
+				err = append(err, r)
+			}
+		}
 		close(undoneTasks)
 	}()
 
 	time.Sleep(time.Second * 3)
 
-	println("Errors:")
+	dprint("Errors:", dCounter)
 	for r := range err {
 		println(r)
 	}
 
-	println("Done tasks:")
-	for r := range result {
-		println(r)
-	}
+	dprint("Done tasks:")
+	result.Range(func(key, value any) bool {
+		dprint(value.(*Ttype).id, string(value.(*Ttype).taskRESULT))
+		putTtype(value)
+		return true
+	})
+	// for r := range result {
+	// 	println(r)
+	// }
 }
